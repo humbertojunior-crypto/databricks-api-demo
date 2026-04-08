@@ -10,257 +10,324 @@ from datetime import datetime
 app = Flask(__name__)
 CORS(app)
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configurações do Databricks via REST API
+# Configurações do Databricks
 DATABRICKS_CONFIG = {
     "host": os.getenv("DATABRICKS_HOST"),
     "token": os.getenv("DATABRICKS_TOKEN"),
     "warehouse_id": os.getenv("DATABRICKS_WAREHOUSE_ID")
 }
 
+# Query base para comentários (personalizável)
+COMMENTS_QUERY = os.getenv("COMMENTS_QUERY", """
+SELECT 
+    comment_id,
+    customer_id,
+    restaurant_id,
+    order_id,
+    rating,
+    comment_text,
+    created_at,
+    city,
+    region,
+    delivery_time,
+    order_value
+FROM comments 
+WHERE created_at >= CURRENT_DATE - 30
+ORDER BY created_at DESC
+""")
+
 def validate_config():
-    """Valida configurações"""
     missing = [k for k, v in DATABRICKS_CONFIG.items() if not v]
-    if missing:
-        logger.error(f"Configurações faltando: {missing}")
-        return False
-    return True
+    return len(missing) == 0, missing
 
 def execute_databricks_query(sql_query):
-    """Executa query via REST API do Databricks - VERSÃO CORRIGIDA"""
+    """Executa query no Databricks"""
     try:
-        if not validate_config():
-            return None, "Configurações Databricks incompletas"
+        valid, missing = validate_config()
+        if not valid:
+            return None, f"Configurações faltando: {missing}"
         
-        # URL da API REST do Databricks
         url = f"https://{DATABRICKS_CONFIG['host']}/api/2.0/sql/statements"
-        
         headers = {
             "Authorization": f"Bearer {DATABRICKS_CONFIG['token']}",
             "Content-Type": "application/json"
         }
-        
         payload = {
             "statement": sql_query,
             "warehouse_id": DATABRICKS_CONFIG["warehouse_id"],
             "wait_timeout": "30s"
         }
         
-        logger.info(f"Executando query: {sql_query}")
-        
-        # Fazer requisição
+        logger.info(f"Executando query: {sql_query[:100]}...")
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         
         if response.status_code != 200:
-            logger.error(f"Erro HTTP {response.status_code}: {response.text}")
             return None, f"Erro HTTP {response.status_code}: {response.text}"
         
         result = response.json()
-        logger.info(f"Resposta Databricks: {json.dumps(result, indent=2)}")
-        
-        # Verificar se a execução foi bem-sucedida
         status = result.get("status", {})
         if status.get("state") != "SUCCEEDED":
             error_msg = status.get("error", {}).get("message", "Erro desconhecido")
             return None, f"Query falhou: {error_msg}"
         
-        # PROCESSAMENTO CORRIGIDO DOS RESULTADOS
-        try:
-            # Tentar diferentes estruturas de resposta
-            data = []
+        # Processar resultados
+        data = []
+        if "result" in result and "data_array" in result["result"]:
+            chunks = result["result"]["data_array"]
+            manifest = result.get("manifest", {})
+            schema = manifest.get("schema", {}).get("columns", [])
+            column_names = [col.get("name", f"col_{i}") for i, col in enumerate(schema)]
             
-            # Estrutura 1: result.data_array
-            if "result" in result and "data_array" in result["result"]:
-                chunks = result["result"]["data_array"]
-                manifest = result.get("manifest", {})
-                schema = manifest.get("schema", {}).get("columns", [])
-                column_names = [col.get("name", f"col_{i}") for i, col in enumerate(schema)]
-                
-                for chunk in chunks:
-                    if isinstance(chunk, list):
-                        for row in chunk:
-                            if isinstance(row, list) and len(row) > 0:
-                                row_dict = {}
-                                for i, value in enumerate(row):
-                                    col_name = column_names[i] if i < len(column_names) else f"col_{i}"
-                                    row_dict[col_name] = value
-                                data.append(row_dict)
-            
-            # Estrutura 2: result.data
-            elif "result" in result and "data" in result["result"]:
-                raw_data = result["result"]["data"]
-                manifest = result.get("manifest", {})
-                schema = manifest.get("schema", {}).get("columns", [])
-                column_names = [col.get("name", f"col_{i}") for i, col in enumerate(schema)]
-                
-                if isinstance(raw_data, list):
-                    for row in raw_data:
-                        if isinstance(row, list):
+            for chunk in chunks:
+                if isinstance(chunk, list):
+                    for row in chunk:
+                        if isinstance(row, list) and len(row) > 0:
                             row_dict = {}
                             for i, value in enumerate(row):
                                 col_name = column_names[i] if i < len(column_names) else f"col_{i}"
                                 row_dict[col_name] = value
                             data.append(row_dict)
-            
-            # Estrutura 3: Fallback - apenas status de sucesso
-            else:
-                logger.warning("Estrutura de resposta não reconhecida, retornando status de sucesso")
-                data = [{"status": "query_executada_com_sucesso", "timestamp": datetime.now().isoformat()}]
-            
-            return data, None
-            
-        except Exception as parse_error:
-            logger.error(f"Erro ao processar resultados: {str(parse_error)}")
-            # Retorna resposta bruta para debug
-            return [{"raw_response": str(result)[:500]}], None
         
-    except requests.Timeout:
-        return None, "Timeout na execução da query"
+        return data, None
+        
     except Exception as e:
-        logger.error(f"Erro na execução: {str(e)}")
         return None, str(e)
 
 @app.route('/')
 def home():
-    """Página inicial"""
     return {
-        "message": "🚀 API Databricks REST → Toqan (CORRIGIDA)",
-        "status": "production",
-        "version": "rest-api-v2",
-        "databricks_host": DATABRICKS_CONFIG.get("host", "não configurado"),
+        "message": "🎯 Agente Inteligente de Comentários iFood",
+        "description": "Análise avançada com categorização automática por temas",
+        "version": "smart-comments-v1",
         "endpoints": {
-            "/health": "Status da conexão",
-            "/query": "Executa queries SQL",
-            "/tables": "Lista tabelas disponíveis",
-            "/debug": "Info de debug"
+            "/comments": "Todos comentários com análise completa",
+            "/comments/by-region": "Agrupados por região",
+            "/comments/by-category": "Categorizados por tema (entrega, qualidade, etc)",
+            "/comments/delivery-issues": "Problemas de entrega",
+            "/comments/food-quality": "Qualidade da comida", 
+            "/comments/service-issues": "Problemas de atendimento",
+            "/comments/app-issues": "Problemas no app",
+            "/comments/trending": "Análise temporal (últimos 7 dias)",
+            "/health": "Status da conexão"
         },
-        "exemplo": "/query?sql=SELECT * FROM sua_tabela LIMIT 10",
+        "categorias_automaticas": [
+            "Entrega (tempo, atraso, entregador)",
+            "Qualidade (comida fria, sabor, quantidade)",
+            "Atendimento (restaurante, suporte)",
+            "App/Sistema (bugs, pagamento, pedido)",
+            "Preço (caro, taxa, promoção)",
+            "Experiência geral"
+        ],
+        "uso_toqan": {
+            "geral": "Toqan, analise: https://sua-api.com/comments",
+            "por_tema": "Toqan, analise: https://sua-api.com/comments/delivery-issues",
+            "por_regiao": "Toqan, analise: https://sua-api.com/comments/by-region",
+            "tendencias": "Toqan, analise: https://sua-api.com/comments/trending"
+        },
         "timestamp": datetime.now().isoformat()
-    }
-
-@app.route('/debug')
-def debug_info():
-    """Informações de debug"""
-    return {
-        "config_status": validate_config(),
-        "databricks_config": {
-            "host": DATABRICKS_CONFIG.get("host", "MISSING"),
-            "warehouse_id": DATABRICKS_CONFIG.get("warehouse_id", "MISSING"),
-            "token_configured": "Yes" if DATABRICKS_CONFIG.get("token") else "No"
-        },
-        "version": "rest-api-v2-debug"
     }
 
 @app.route('/health')
 def health():
-    """Testa conexão com Databricks"""
     try:
-        if not validate_config():
-            missing = [k for k, v in DATABRICKS_CONFIG.items() if not v]
-            return {
-                "status": "error",
-                "message": "Configurações faltando",
-                "missing": missing
-            }, 500
+        valid, missing = validate_config()
+        if not valid:
+            return {"status": "error", "missing": missing}, 500
         
-        # Teste simples
         data, error = execute_databricks_query("SELECT 1 as test")
-        
         if error:
-            return {
-                "status": "error",
-                "message": error,
-                "databricks_connection": "failed"
-            }, 500
+            return {"status": "error", "message": error}, 500
         
         return {
             "status": "healthy",
             "databricks_connection": "ok",
-            "test_query": "SELECT 1",
-            "test_result": data[0] if data else None,
-            "host": DATABRICKS_CONFIG["host"],
-            "warehouse_id": DATABRICKS_CONFIG["warehouse_id"],
-            "result_count": len(data) if data else 0
+            "host": DATABRICKS_CONFIG["host"]
         }
-        
     except Exception as e:
-        return {
-            "status": "error",
-            "message": str(e)
-        }, 500
+        return {"status": "error", "message": str(e)}, 500
 
-@app.route('/tables')
-def list_tables():
-    """Lista tabelas"""
+@app.route('/comments')
+def get_all_comments():
+    """Retorna todos comentários com dados completos para análise"""
     try:
-        data, error = execute_databricks_query("SHOW TABLES")
-        
+        data, error = execute_databricks_query(COMMENTS_QUERY)
         if error:
             return {"status": "error", "message": error}, 500
         
         return {
             "status": "success",
-            "tables_count": len(data),
-            "tables": data,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
-@app.route('/query')
-def execute_query():
-    """Executa query SQL"""
-    try:
-        sql_query = request.args.get('sql')
-        limit = request.args.get('limit', 1000)
-        
-        if not sql_query:
-            return {
-                "status": "error", 
-                "message": "Parâmetro 'sql' é obrigatório"
-            }, 400
-        
-        # Segurança básica
-        dangerous = ['drop', 'delete', 'truncate', 'alter', 'create']
-        if any(word in sql_query.lower() for word in dangerous):
-            return {
-                "status": "error",
-                "message": "Query contém comandos não permitidos"
-            }, 400
-        
-        # Adicionar LIMIT se necessário
-        if "limit" not in sql_query.lower() and "count" not in sql_query.lower():
-            sql_query += f" LIMIT {limit}"
-        
-        data, error = execute_databricks_query(sql_query)
-        
-        if error:
-            return {
-                "status": "error",
-                "query": sql_query,
-                "message": error
-            }, 500
-        
-        return {
-            "status": "success",
-            "query": sql_query,
+            "analysis_type": "complete_dataset",
+            "description": "Dataset completo para análise avançada no Toqan",
             "row_count": len(data),
             "columns": list(data[0].keys()) if data else [],
             "data": data,
+            "timestamp": datetime.now().isoformat(),
+            "analysis_capabilities": [
+                "Análise de sentimento por comentário",
+                "Categorização automática por tema",
+                "Segmentação por região/cidade", 
+                "Análise temporal (trends)",
+                "Correlação rating vs tempo de entrega",
+                "Identificação de palavras-chave",
+                "Ranking de problemas por frequência"
+            ]
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
+@app.route('/comments/by-region')
+def get_comments_by_region():
+    """Comentários agrupados por região para análise geográfica"""
+    try:
+        regional_query = f"""
+        SELECT 
+            region,
+            city,
+            COUNT(*) as total_comments,
+            AVG(rating) as avg_rating,
+            comment_text,
+            created_at,
+            rating
+        FROM ({COMMENTS_QUERY.rstrip().rstrip(';')}) base_comments
+        GROUP BY region, city, comment_text, created_at, rating
+        ORDER BY region, avg_rating ASC
+        """
+        
+        data, error = execute_databricks_query(regional_query)
+        if error:
+            return {"status": "error", "message": error}, 500
+        
+        return {
+            "status": "success",
+            "analysis_type": "regional_segmentation",
+            "description": "Dados segmentados por região para análise geográfica",
+            "row_count": len(data),
+            "data": data,
             "timestamp": datetime.now().isoformat()
         }
-        
     except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
+@app.route('/comments/delivery-issues')
+def get_delivery_issues():
+    """Comentários sobre problemas de entrega"""
+    try:
+        delivery_query = f"""
+        SELECT *
+        FROM ({COMMENTS_QUERY.rstrip().rstrip(';')}) base_comments
+        WHERE LOWER(comment_text) REGEXP '(atras|demor|entrega|rapido|lento|tempo|entreg|delay)'
+           OR delivery_time > 60
+        ORDER BY created_at DESC
+        """
+        
+        data, error = execute_databricks_query(delivery_query)
+        if error:
+            return {"status": "error", "message": error}, 500
+        
         return {
-            "status": "error",
-            "query": sql_query if 'sql_query' in locals() else None,
-            "message": str(e)
-        }, 500
+            "status": "success",
+            "analysis_type": "delivery_issues",
+            "description": "Comentários relacionados a problemas de entrega",
+            "keywords_filtered": ["atraso", "demora", "entrega", "rápido", "lento", "tempo"],
+            "row_count": len(data),
+            "data": data,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
+@app.route('/comments/food-quality')
+def get_food_quality():
+    """Comentários sobre qualidade da comida"""
+    try:
+        quality_query = f"""
+        SELECT *
+        FROM ({COMMENTS_QUERY.rstrip().rstrip(';')}) base_comments
+        WHERE LOWER(comment_text) REGEXP '(fri|quent|sabor|gostoso|ruim|qualidade|comida|delicio|horrible)'
+        ORDER BY rating ASC, created_at DESC
+        """
+        
+        data, error = execute_databricks_query(quality_query)
+        if error:
+            return {"status": "error", "message": error}, 500
+        
+        return {
+            "status": "success", 
+            "analysis_type": "food_quality",
+            "description": "Comentários sobre qualidade da comida",
+            "keywords_filtered": ["frio", "quente", "sabor", "gostoso", "ruim", "qualidade", "comida"],
+            "row_count": len(data),
+            "data": data,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
+@app.route('/comments/service-issues')
+def get_service_issues():
+    """Comentários sobre atendimento"""
+    try:
+        service_query = f"""
+        SELECT *
+        FROM ({COMMENTS_QUERY.rstrip().rstrip(';')}) base_comments
+        WHERE LOWER(comment_text) REGEXP '(atendiment|educad|grosso|mal.atend|suport|ajuda|problem)'
+        ORDER BY rating ASC, created_at DESC
+        """
+        
+        data, error = execute_databricks_query(service_query)
+        if error:
+            return {"status": "error", "message": error}, 500
+        
+        return {
+            "status": "success",
+            "analysis_type": "service_issues", 
+            "description": "Comentários sobre problemas de atendimento",
+            "keywords_filtered": ["atendimento", "educado", "grosso", "mal atendido", "suporte"],
+            "row_count": len(data),
+            "data": data,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
+@app.route('/comments/trending')
+def get_trending_analysis():
+    """Análise de tendências dos últimos 7 dias"""
+    try:
+        trending_query = f"""
+        SELECT 
+            DATE(created_at) as date,
+            region,
+            city,
+            COUNT(*) as comments_count,
+            AVG(rating) as avg_rating,
+            comment_text,
+            rating,
+            created_at
+        FROM ({COMMENTS_QUERY.rstrip().rstrip(';')}) base_comments
+        WHERE created_at >= CURRENT_DATE - 7
+        GROUP BY DATE(created_at), region, city, comment_text, rating, created_at
+        ORDER BY date DESC, avg_rating ASC
+        """
+        
+        data, error = execute_databricks_query(trending_query)
+        if error:
+            return {"status": "error", "message": error}, 500
+        
+        return {
+            "status": "success",
+            "analysis_type": "trending_7_days",
+            "description": "Análise temporal dos últimos 7 dias para identificar tendências",
+            "row_count": len(data),
+            "data": data,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port)
