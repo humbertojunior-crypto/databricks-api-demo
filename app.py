@@ -1,10 +1,9 @@
-
-from flask import Flask, request, jsonify, render_template_string
-from databricks import sql
-import pandas as pd
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import requests
+import json
 import os
 import logging
-from flask_cors import CORS
 from datetime import datetime
 
 app = Flask(__name__)
@@ -14,53 +13,94 @@ CORS(app)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configurações do Databricks (via variáveis de ambiente)
+# Configurações do Databricks via REST API
 DATABRICKS_CONFIG = {
-    "server_hostname": os.getenv("DATABRICKS_HOST"),
-    "http_path": os.getenv("DATABRICKS_PATH"), 
-    "access_token": os.getenv("DATABRICKS_TOKEN")
+    "host": os.getenv("DATABRICKS_HOST"),
+    "token": os.getenv("DATABRICKS_TOKEN"),
+    "warehouse_id": os.getenv("DATABRICKS_WAREHOUSE_ID")
 }
 
 def validate_config():
-    """Valida se todas as configurações necessárias estão presentes"""
-    missing = []
-    for key, value in DATABRICKS_CONFIG.items():
-        if not value:
-            missing.append(key)
-    
+    """Valida configurações"""
+    missing = [k for k, v in DATABRICKS_CONFIG.items() if not v]
     if missing:
         logger.error(f"Configurações faltando: {missing}")
         return False
     return True
 
-def get_databricks_connection():
-    """Cria conexão com Databricks"""
+def execute_databricks_query(sql_query):
+    """Executa query via REST API do Databricks"""
     try:
         if not validate_config():
-            return None
-            
-        connection = sql.connect(**DATABRICKS_CONFIG)
-        logger.info("✅ Conexão Databricks estabelecida")
-        return connection
+            return None, "Configurações Databricks incompletas"
+        
+        # URL da API REST do Databricks
+        url = f"https://{DATABRICKS_CONFIG['host']}/api/2.0/sql/statements"
+        
+        headers = {
+            "Authorization": f"Bearer {DATABRICKS_CONFIG['token']}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "statement": sql_query,
+            "warehouse_id": DATABRICKS_CONFIG["warehouse_id"],
+            "wait_timeout": "30s"
+        }
+        
+        logger.info(f"Executando query: {sql_query}")
+        
+        # Fazer requisição
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
+        
+        if response.status_code != 200:
+            logger.error(f"Erro HTTP {response.status_code}: {response.text}")
+            return None, f"Erro HTTP {response.status_code}: {response.text}"
+        
+        result = response.json()
+        
+        # Verificar se a execução foi bem-sucedida
+        if result.get("status", {}).get("state") != "SUCCEEDED":
+            error_msg = result.get("status", {}).get("error", {}).get("message", "Erro desconhecido")
+            return None, f"Query falhou: {error_msg}"
+        
+        # Extrair dados dos resultados
+        manifest = result.get("manifest", {})
+        chunks = result.get("result", {}).get("data_array", [])
+        
+        # Schema das colunas
+        schema = manifest.get("schema", {}).get("columns", [])
+        column_names = [col.get("name") for col in schema]
+        
+        # Processar dados
+        data = []
+        for chunk in chunks:
+            for row in chunk:
+                row_dict = {column_names[i]: row[i] for i in range(len(row))}
+                data.append(row_dict)
+        
+        return data, None
+        
+    except requests.Timeout:
+        return None, "Timeout na execução da query"
     except Exception as e:
-        logger.error(f"❌ Erro ao conectar Databricks: {str(e)}")
-        return None
+        logger.error(f"Erro na execução: {str(e)}")
+        return None, str(e)
 
 @app.route('/')
 def home():
-    """Página inicial da API Real"""
+    """Página inicial"""
     return {
-        "message": "🚀 API Databricks Real → Toqan",
+        "message": "🚀 API Databricks REST → Toqan",
         "status": "production",
-        "databricks_host": DATABRICKS_CONFIG.get("server_hostname", "não configurado"),
+        "version": "rest-api",
+        "databricks_host": DATABRICKS_CONFIG.get("host", "não configurado"),
         "endpoints": {
-            "/health": "Status da conexão Databricks",
-            "/query": "Executa queries SQL no Databricks",
-            "/tables": "Lista tabelas disponíveis",
-            "/describe/<table>": "Estrutura da tabela"
+            "/health": "Status da conexão",
+            "/query": "Executa queries SQL",
+            "/tables": "Lista tabelas disponíveis"
         },
-        "exemplo_uso": "/query?sql=SELECT * FROM sua_tabela LIMIT 10",
-        "configuracao": "Configurado via variáveis de ambiente",
+        "exemplo": "/query?sql=SELECT * FROM sua_tabela LIMIT 10",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -69,239 +109,107 @@ def health():
     """Testa conexão com Databricks"""
     try:
         if not validate_config():
+            missing = [k for k, v in DATABRICKS_CONFIG.items() if not v]
             return {
                 "status": "error",
-                "message": "Configurações Databricks não encontradas",
-                "missing": [k for k, v in DATABRICKS_CONFIG.items() if not v]
+                "message": "Configurações faltando",
+                "missing": missing
             }, 500
-            
-        connection = get_databricks_connection()
-        if not connection:
+        
+        # Teste simples
+        data, error = execute_databricks_query("SELECT 1 as test, CURRENT_TIMESTAMP() as timestamp")
+        
+        if error:
             return {
-                "status": "error", 
-                "message": "Falha na conexão com Databricks"
+                "status": "error",
+                "message": error,
+                "databricks_connection": "failed"
             }, 500
-            
-        # Teste rápido
-        cursor = connection.cursor()
-        cursor.execute("SELECT 1 as test, CURRENT_TIMESTAMP() as timestamp")
-        result = cursor.fetchone()
-        cursor.close()
-        connection.close()
         
         return {
             "status": "healthy",
             "databricks_connection": "ok",
             "test_query": "SELECT 1",
-            "test_result": result[0] if result else None,
-            "databricks_time": str(result[1]) if result and len(result) > 1 else None,
-            "host": DATABRICKS_CONFIG["server_hostname"]
+            "test_result": data[0] if data else None,
+            "host": DATABRICKS_CONFIG["host"],
+            "warehouse_id": DATABRICKS_CONFIG["warehouse_id"]
         }
         
     except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        return {
-            "status": "error",
-            "message": str(e),
-            "databricks_connection": "failed"
-        }, 500
-
-@app.route('/tables')
-def list_tables():
-    """Lista todas as tabelas disponíveis"""
-    try:
-        connection = get_databricks_connection()
-        if not connection:
-            return {"status": "error", "message": "Conexão Databricks falhou"}, 500
-            
-        cursor = connection.cursor()
-        cursor.execute("SHOW TABLES")
-        
-        results = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        
-        cursor.close()
-        connection.close()
-        
-        # Converte para lista de dicionários
-        tables = []
-        for row in results:
-            table_dict = {columns[i]: row[i] for i in range(len(columns))}
-            tables.append(table_dict)
-            
-        return {
-            "status": "success",
-            "tables_count": len(tables),
-            "tables": tables,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"List tables error: {str(e)}")
         return {
             "status": "error",
             "message": str(e)
         }, 500
 
+@app.route('/tables')
+def list_tables():
+    """Lista tabelas"""
+    try:
+        data, error = execute_databricks_query("SHOW TABLES")
+        
+        if error:
+            return {"status": "error", "message": error}, 500
+        
+        return {
+            "status": "success",
+            "tables_count": len(data),
+            "tables": data,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
 @app.route('/query')
 def execute_query():
-    """Executa query SQL no Databricks"""
+    """Executa query SQL"""
     try:
-        # Validação da query
         sql_query = request.args.get('sql')
         limit = request.args.get('limit', 1000)
         
         if not sql_query:
             return {
-                "status": "error",
-                "message": "Parâmetro 'sql' é obrigatório",
-                "exemplo": "/query?sql=SELECT * FROM sua_tabela LIMIT 10"
-            }, 400
-        
-        # Segurança básica - evitar queries perigosas
-        dangerous_keywords = ['drop', 'delete', 'truncate', 'alter', 'create']
-        if any(keyword in sql_query.lower() for keyword in dangerous_keywords):
-            return {
                 "status": "error", 
-                "message": "Query contém comandos não permitidos",
-                "blocked_keywords": dangerous_keywords
+                "message": "Parâmetro 'sql' é obrigatório"
             }, 400
         
-        # Adicionar LIMIT se não tiver
-        if "limit" not in sql_query.lower() and "count" not in sql_query.lower():
+        # Segurança básica
+        dangerous = ['drop', 'delete', 'truncate', 'alter', 'create']
+        if any(word in sql_query.lower() for word in dangerous):
+            return {
+                "status": "error",
+                "message": "Query contém comandos não permitidos"
+            }, 400
+        
+        # Adicionar LIMIT se necessário
+        if "limit" not in sql_query.lower():
             sql_query += f" LIMIT {limit}"
         
-        # Executar query
-        connection = get_databricks_connection()
-        if not connection:
-            return {"status": "error", "message": "Conexão Databricks falhou"}, 500
-            
-        cursor = connection.cursor()
-        logger.info(f"Executando query: {sql_query}")
+        data, error = execute_databricks_query(sql_query)
         
-        cursor.execute(sql_query)
-        results = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        
-        cursor.close()
-        connection.close()
-        
-        # Converte para lista de dicionários
-        data = []
-        for row in results:
-            row_dict = {columns[i]: row[i] for i in range(len(columns))}
-            data.append(row_dict)
+        if error:
+            return {
+                "status": "error",
+                "query": sql_query,
+                "message": error
+            }, 500
         
         return {
             "status": "success",
             "query": sql_query,
             "row_count": len(data),
-            "columns": columns,
+            "columns": list(data[0].keys()) if data else [],
             "data": data,
-            "timestamp": datetime.now().isoformat(),
-            "execution_time": "< 1s"
-        }
-        
-    except Exception as e:
-        logger.error(f"Query execution error: {str(e)}")
-        return {
-            "status": "error",
-            "query": sql_query,
-            "message": str(e)
-        }, 500
-
-@app.route('/describe/<table_name>')
-def describe_table(table_name):
-    """Retorna estrutura da tabela"""
-    try:
-        connection = get_databricks_connection()
-        if not connection:
-            return {"status": "error", "message": "Conexão Databricks falhou"}, 500
-            
-        cursor = connection.cursor()
-        cursor.execute(f"DESCRIBE TABLE {table_name}")
-        
-        results = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        
-        cursor.close()
-        connection.close()
-        
-        # Converte para lista de dicionários
-        schema = []
-        for row in results:
-            col_dict = {columns[i]: row[i] for i in range(len(columns))}
-            schema.append(col_dict)
-            
-        return {
-            "status": "success",
-            "table": table_name,
-            "schema": schema,
             "timestamp": datetime.now().isoformat()
         }
         
     except Exception as e:
-        logger.error(f"Describe table error: {str(e)}")
         return {
             "status": "error",
-            "table": table_name,
-            "message": str(e)
-        }, 500
-
-@app.route('/quick/<table_name>')
-def quick_sample(table_name):
-    """Amostra rápida de uma tabela"""
-    try:
-        limit = request.args.get('limit', 10)
-        sql_query = f"SELECT * FROM {table_name} LIMIT {limit}"
-        
-        # Redireciona para o endpoint de query
-        return execute_query_direct(sql_query)
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "table": table_name,
-            "message": str(e)
-        }, 500
-
-def execute_query_direct(sql_query):
-    """Executa query diretamente (função auxiliar)"""
-    try:
-        connection = get_databricks_connection()
-        if not connection:
-            return {"status": "error", "message": "Conexão Databricks falhou"}, 500
-            
-        cursor = connection.cursor()
-        cursor.execute(sql_query)
-        
-        results = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
-        
-        cursor.close()
-        connection.close()
-        
-        data = []
-        for row in results:
-            row_dict = {columns[i]: row[i] for i in range(len(columns))}
-            data.append(row_dict)
-        
-        return {
-            "status": "success",
-            "query": sql_query,
-            "row_count": len(data),
-            "columns": columns,
-            "data": data
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "query": sql_query,
+            "query": sql_query if 'sql_query' in locals() else None,
             "message": str(e)
         }, 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(host='0.0.0.0', port=port)
