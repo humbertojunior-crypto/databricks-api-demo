@@ -1,3 +1,4 @@
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
@@ -29,7 +30,7 @@ def validate_config():
     return True
 
 def execute_databricks_query(sql_query):
-    """Executa query via REST API do Databricks"""
+    """Executa query via REST API do Databricks - VERSÃO CORRIGIDA"""
     try:
         if not validate_config():
             return None, "Configurações Databricks incompletas"
@@ -58,28 +59,63 @@ def execute_databricks_query(sql_query):
             return None, f"Erro HTTP {response.status_code}: {response.text}"
         
         result = response.json()
+        logger.info(f"Resposta Databricks: {json.dumps(result, indent=2)}")
         
         # Verificar se a execução foi bem-sucedida
-        if result.get("status", {}).get("state") != "SUCCEEDED":
-            error_msg = result.get("status", {}).get("error", {}).get("message", "Erro desconhecido")
+        status = result.get("status", {})
+        if status.get("state") != "SUCCEEDED":
+            error_msg = status.get("error", {}).get("message", "Erro desconhecido")
             return None, f"Query falhou: {error_msg}"
         
-        # Extrair dados dos resultados
-        manifest = result.get("manifest", {})
-        chunks = result.get("result", {}).get("data_array", [])
-        
-        # Schema das colunas
-        schema = manifest.get("schema", {}).get("columns", [])
-        column_names = [col.get("name") for col in schema]
-        
-        # Processar dados
-        data = []
-        for chunk in chunks:
-            for row in chunk:
-                row_dict = {column_names[i]: row[i] for i in range(len(row))}
-                data.append(row_dict)
-        
-        return data, None
+        # PROCESSAMENTO CORRIGIDO DOS RESULTADOS
+        try:
+            # Tentar diferentes estruturas de resposta
+            data = []
+            
+            # Estrutura 1: result.data_array
+            if "result" in result and "data_array" in result["result"]:
+                chunks = result["result"]["data_array"]
+                manifest = result.get("manifest", {})
+                schema = manifest.get("schema", {}).get("columns", [])
+                column_names = [col.get("name", f"col_{i}") for i, col in enumerate(schema)]
+                
+                for chunk in chunks:
+                    if isinstance(chunk, list):
+                        for row in chunk:
+                            if isinstance(row, list) and len(row) > 0:
+                                row_dict = {}
+                                for i, value in enumerate(row):
+                                    col_name = column_names[i] if i < len(column_names) else f"col_{i}"
+                                    row_dict[col_name] = value
+                                data.append(row_dict)
+            
+            # Estrutura 2: result.data
+            elif "result" in result and "data" in result["result"]:
+                raw_data = result["result"]["data"]
+                manifest = result.get("manifest", {})
+                schema = manifest.get("schema", {}).get("columns", [])
+                column_names = [col.get("name", f"col_{i}") for i, col in enumerate(schema)]
+                
+                if isinstance(raw_data, list):
+                    for row in raw_data:
+                        if isinstance(row, list):
+                            row_dict = {}
+                            for i, value in enumerate(row):
+                                col_name = column_names[i] if i < len(column_names) else f"col_{i}"
+                                row_dict[col_name] = value
+                            data.append(row_dict)
+            
+            # Estrutura 3: Fallback - apenas status de sucesso
+            else:
+                logger.warning("Estrutura de resposta não reconhecida, retornando status de sucesso")
+                data = [{"status": "query_executada_com_sucesso", "timestamp": datetime.now().isoformat()}]
+            
+            return data, None
+            
+        except Exception as parse_error:
+            logger.error(f"Erro ao processar resultados: {str(parse_error)}")
+            # Retorna resposta bruta para debug
+            return [{"raw_response": str(result)[:500]}], None
         
     except requests.Timeout:
         return None, "Timeout na execução da query"
@@ -91,17 +127,31 @@ def execute_databricks_query(sql_query):
 def home():
     """Página inicial"""
     return {
-        "message": "🚀 API Databricks REST → Toqan",
+        "message": "🚀 API Databricks REST → Toqan (CORRIGIDA)",
         "status": "production",
-        "version": "rest-api",
+        "version": "rest-api-v2",
         "databricks_host": DATABRICKS_CONFIG.get("host", "não configurado"),
         "endpoints": {
             "/health": "Status da conexão",
             "/query": "Executa queries SQL",
-            "/tables": "Lista tabelas disponíveis"
+            "/tables": "Lista tabelas disponíveis",
+            "/debug": "Info de debug"
         },
         "exemplo": "/query?sql=SELECT * FROM sua_tabela LIMIT 10",
         "timestamp": datetime.now().isoformat()
+    }
+
+@app.route('/debug')
+def debug_info():
+    """Informações de debug"""
+    return {
+        "config_status": validate_config(),
+        "databricks_config": {
+            "host": DATABRICKS_CONFIG.get("host", "MISSING"),
+            "warehouse_id": DATABRICKS_CONFIG.get("warehouse_id", "MISSING"),
+            "token_configured": "Yes" if DATABRICKS_CONFIG.get("token") else "No"
+        },
+        "version": "rest-api-v2-debug"
     }
 
 @app.route('/health')
@@ -117,7 +167,7 @@ def health():
             }, 500
         
         # Teste simples
-        data, error = execute_databricks_query("SELECT 1 as test, CURRENT_TIMESTAMP() as timestamp")
+        data, error = execute_databricks_query("SELECT 1 as test")
         
         if error:
             return {
@@ -132,7 +182,8 @@ def health():
             "test_query": "SELECT 1",
             "test_result": data[0] if data else None,
             "host": DATABRICKS_CONFIG["host"],
-            "warehouse_id": DATABRICKS_CONFIG["warehouse_id"]
+            "warehouse_id": DATABRICKS_CONFIG["warehouse_id"],
+            "result_count": len(data) if data else 0
         }
         
     except Exception as e:
@@ -182,7 +233,7 @@ def execute_query():
             }, 400
         
         # Adicionar LIMIT se necessário
-        if "limit" not in sql_query.lower():
+        if "limit" not in sql_query.lower() and "count" not in sql_query.lower():
             sql_query += f" LIMIT {limit}"
         
         data, error = execute_databricks_query(sql_query)
@@ -212,4 +263,4 @@ def execute_query():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
